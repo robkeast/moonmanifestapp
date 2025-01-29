@@ -4,6 +4,8 @@ import { Home } from './pages/Home';
 import { Login } from './pages/Login';
 import { SignUp } from './pages/SignUp';
 import { Dashboard } from './pages/Dashboard';
+import { TestDb } from './pages/TestDb';
+import { TestSignup } from './pages/TestSignup';
 import { PrivateRoute } from './components/PrivateRoute';
 
 function App() {
@@ -13,6 +15,8 @@ function App() {
         <Route path="/" element={<Home />} />
         <Route path="/login" element={<Login />} />
         <Route path="/signup" element={<SignUp />} />
+        <Route path="/test-db" element={<TestDb />} />
+        <Route path="/test-signup" element={<TestSignup />} />
         <Route
           path="/dashboard/*"
           element={
