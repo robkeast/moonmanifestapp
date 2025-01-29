@@ -1,32 +1,189 @@
 import { createClient } from '@supabase/supabase-js';
-import * as fs from 'fs';
-import * as dotenv from 'dotenv';
+import fs from 'fs';
+import dotenv from 'dotenv';
 
 // Load environment variables
 dotenv.config();
 
 const supabaseUrl = process.env.VITE_SUPABASE_URL;
-const supabaseKey = process.env.VITE_SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
 
-if (!supabaseUrl || !supabaseKey) {
-  throw new Error('Missing Supabase environment variables');
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error('Missing required environment variables');
+  process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-async function checkTableExists(tableName: string): Promise<boolean> {
-  const { data, error } = await supabase
-    .from(tableName)
-    .select('*')
-    .limit(1);
-  
-  // If we get a "relation does not exist" error, the table doesn't exist
-  if (error?.message?.includes('relation') && error?.message?.includes('does not exist')) {
-    return false;
+async function getTableSchema(tableName: string): Promise<string> {
+  const { data, error } = await supabase.rpc('exec_sql', {
+    sql: `
+      SELECT 
+        'CREATE TABLE IF NOT EXISTS public.' || quote_ident(c.relname) || ' (' || 
+        string_agg(
+          quote_ident(a.attname) || ' ' || 
+          pg_catalog.format_type(a.atttypid, a.atttypmod) || 
+          CASE 
+            WHEN a.attnotnull THEN ' NOT NULL'
+            ELSE ''
+          END ||
+          CASE 
+            WHEN a.atthasdef THEN ' DEFAULT ' || pg_get_expr(d.adbin, d.adrelid)
+            ELSE ''
+          END,
+          E',\n    '
+        ) || 
+        CASE 
+          WHEN c.relkind = 'r' THEN E',\n    ' || string_agg(
+            'CONSTRAINT ' || quote_ident(con.conname) || ' ' || 
+            pg_get_constraintdef(con.oid),
+            E',\n    '
+          )
+          ELSE ''
+        END ||
+        ');' as schema_definition
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+      LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+      LEFT JOIN pg_catalog.pg_constraint con ON con.conrelid = c.oid
+      WHERE n.nspname = 'public'
+        AND c.relname = $1
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+      GROUP BY c.relname, c.relkind;
+    `,
+    params: [tableName]
+  });
+
+  if (error) {
+    console.error(`Error getting schema for table ${tableName}:`, error);
+    return '';
   }
-  
-  // If we get any other error (like permissions) or data, the table exists
-  return true;
+
+  return data || '';
+}
+
+async function getTablePolicies(tableName: string): Promise<string> {
+  const { data, error } = await supabase.rpc('exec_sql', {
+    sql: `
+      SELECT 
+        'ALTER TABLE public.' || quote_ident($1) || ' ENABLE ROW LEVEL SECURITY;' || E'\n' ||
+        string_agg(
+          'CREATE POLICY ' || quote_ident(polname) || ' ON public.' || quote_ident($1) || 
+          ' FOR ' || polcmd || 
+          CASE 
+            WHEN polroles <> '{public}' THEN ' TO ' || array_to_string(polroles, ', ')
+            ELSE ''
+          END ||
+          ' USING (' || pg_get_expr(polqual, polrelid) || ')' ||
+          CASE 
+            WHEN polwithcheck IS NOT NULL THEN ' WITH CHECK (' || pg_get_expr(polwithcheck, polrelid) || ')'
+            ELSE ''
+          END || ';',
+          E'\n'
+        ) as policies
+      FROM pg_policy
+      WHERE polrelid = ('public.' || $1)::regclass;
+    `,
+    params: [tableName]
+  });
+
+  if (error) {
+    console.error(`Error getting policies for table ${tableName}:`, error);
+    return '';
+  }
+
+  return data || '';
+}
+
+async function getTableTriggers(tableName: string): Promise<string> {
+  const { data, error } = await supabase.rpc('exec_sql', {
+    sql: `
+      SELECT 
+        string_agg(
+          'CREATE TRIGGER ' || quote_ident(t.tgname) ||
+          ' ' || 
+          CASE 
+            WHEN t.tgtype & (1<<0) = (1<<0) THEN 'BEFORE'
+            WHEN t.tgtype & (1<<1) = (1<<1) THEN 'AFTER'
+            WHEN t.tgtype & (1<<6) = (1<<6) THEN 'INSTEAD OF'
+          END ||
+          ' ' ||
+          array_to_string(array(
+            SELECT unnest(array['INSERT', 'DELETE', 'UPDATE', 'TRUNCATE'])
+            WHERE t.tgtype & (1<<1) = (1<<1)
+          ), ' OR ') ||
+          ' ON public.' || quote_ident($1) ||
+          ' FOR EACH ' || 
+          CASE 
+            WHEN t.tgtype & (1<<4) = (1<<4) THEN 'ROW'
+            ELSE 'STATEMENT'
+          END ||
+          ' EXECUTE FUNCTION ' || p.proname || '();',
+          E'\n'
+        ) as triggers
+      FROM pg_trigger t
+      JOIN pg_proc p ON p.oid = t.tgfoid
+      WHERE t.tgrelid = ('public.' || $1)::regclass
+        AND NOT t.tgisinternal;
+    `,
+    params: [tableName]
+  });
+
+  if (error) {
+    console.error(`Error getting triggers for table ${tableName}:`, error);
+    return '';
+  }
+
+  return data || '';
+}
+
+async function getTableIndexes(tableName: string): Promise<string> {
+  const { data, error } = await supabase.rpc('exec_sql', {
+    sql: `
+      SELECT string_agg(
+        'CREATE INDEX IF NOT EXISTS ' || quote_ident(i.relname) || 
+        ' ON public.' || quote_ident($1) || ' USING ' || am.amname || 
+        ' (' || pg_get_indexdef(i.oid, 0, false) || ');',
+        E'\n'
+      ) as indexes
+      FROM pg_index x
+      JOIN pg_class i ON i.oid = x.indexrelid
+      JOIN pg_class t ON t.oid = x.indrelid
+      JOIN pg_am am ON i.relam = am.oid
+      WHERE t.relname = $1
+        AND t.relnamespace = 'public'::regnamespace
+        AND NOT x.indisprimary
+        AND NOT x.indisunique;
+    `,
+    params: [tableName]
+  });
+
+  if (error) {
+    console.error(`Error getting indexes for table ${tableName}:`, error);
+    return '';
+  }
+
+  return data || '';
+}
+
+async function getAllTables(): Promise<string[]> {
+  const { data, error } = await supabase.rpc('exec_sql', {
+    sql: `
+      SELECT tablename
+      FROM pg_catalog.pg_tables
+      WHERE schemaname = 'public'
+      ORDER BY tablename;
+    `
+  });
+
+  if (error) {
+    console.error('Error getting table list:', error);
+    return [];
+  }
+
+  return data?.map((row: any) => row.tablename) || [];
 }
 
 async function extractSchema() {
@@ -34,165 +191,36 @@ async function extractSchema() {
     console.log('Extracting database schema...');
     let schema = '-- Database Schema Export\n\n';
 
-    // List of tables to check for
-    const tablesToCheck = [
-      'users',
-      'moon_phases',
-      'moon_manifestations',
-      'user_manifestations',
-      'manifestation_categories',
-      'user_preferences',
-      'notifications'
-    ];
+    // Get all tables
+    const tables = await getAllTables();
+    console.log('Found tables:', tables);
 
-    console.log('Checking for tables:', tablesToCheck);
-
-    // Check each table
-    for (const tableName of tablesToCheck) {
-      const exists = await checkTableExists(tableName);
-      console.log(`Table ${tableName}: ${exists ? 'exists' : 'does not exist'}`);
+    // Extract schema for each table
+    for (const tableName of tables) {
+      console.log(`Processing table: ${tableName}`);
       
-      if (exists) {
-        // Add table definition based on table name
-        switch (tableName) {
-          case 'users':
-            schema += '-- Table: users\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.users (\n';
-            schema += '    id UUID PRIMARY KEY REFERENCES auth.users(id),\n';
-            schema += '    email TEXT NOT NULL,\n';
-            schema += '    first_name TEXT,\n';
-            schema += '    last_name TEXT,\n';
-            schema += '    birth_date DATE,\n';
-            schema += '    postcode TEXT,\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-
-            // Add RLS policies for users table
-            schema += '-- RLS Policies for users table\n';
-            schema += 'ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;\n\n';
-            
-            schema += 'CREATE POLICY "Users can view their own profile"\n';
-            schema += '    ON public.users\n';
-            schema += '    FOR SELECT\n';
-            schema += '    USING (auth.uid() = id);\n\n';
-            
-            schema += 'CREATE POLICY "Users can update their own profile"\n';
-            schema += '    ON public.users\n';
-            schema += '    FOR UPDATE\n';
-            schema += '    USING (auth.uid() = id);\n\n';
-            
-            schema += 'CREATE POLICY "Users can insert their own profile"\n';
-            schema += '    ON public.users\n';
-            schema += '    FOR INSERT\n';
-            schema += '    WITH CHECK (auth.uid() = id);\n\n';
-            
-            schema += 'CREATE POLICY "Enable read access for all users"\n';
-            schema += '    ON public.users\n';
-            schema += '    FOR SELECT\n';
-            schema += '    USING (true);\n\n';
-            break;
-
-          case 'moon_phases':
-            schema += '-- Table: moon_phases\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.moon_phases (\n';
-            schema += '    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n';
-            schema += '    phase_name TEXT NOT NULL,\n';
-            schema += '    phase_date TIMESTAMP WITH TIME ZONE NOT NULL,\n';
-            schema += '    phase_type TEXT NOT NULL,\n';
-            schema += '    description TEXT,\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-            break;
-
-          case 'moon_manifestations':
-            schema += '-- Table: moon_manifestations\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.moon_manifestations (\n';
-            schema += '    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n';
-            schema += '    moon_phase_id UUID REFERENCES public.moon_phases(id),\n';
-            schema += '    title TEXT NOT NULL,\n';
-            schema += '    description TEXT,\n';
-            schema += '    category_id UUID REFERENCES public.manifestation_categories(id),\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-            break;
-
-          case 'user_manifestations':
-            schema += '-- Table: user_manifestations\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.user_manifestations (\n';
-            schema += '    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n';
-            schema += '    user_id UUID REFERENCES public.users(id),\n';
-            schema += '    manifestation_id UUID REFERENCES public.moon_manifestations(id),\n';
-            schema += '    status TEXT NOT NULL,\n';
-            schema += '    notes TEXT,\n';
-            schema += '    completion_date TIMESTAMP WITH TIME ZONE,\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-            break;
-
-          case 'manifestation_categories':
-            schema += '-- Table: manifestation_categories\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.manifestation_categories (\n';
-            schema += '    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n';
-            schema += '    name TEXT NOT NULL,\n';
-            schema += '    description TEXT,\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-            break;
-
-          case 'user_preferences':
-            schema += '-- Table: user_preferences\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.user_preferences (\n';
-            schema += '    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n';
-            schema += '    user_id UUID REFERENCES public.users(id),\n';
-            schema += '    notification_enabled BOOLEAN DEFAULT true,\n';
-            schema += '    notification_frequency TEXT DEFAULT \'daily\',\n';
-            schema += '    theme TEXT DEFAULT \'light\',\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-            break;
-
-          case 'notifications':
-            schema += '-- Table: notifications\n';
-            schema += 'CREATE TABLE IF NOT EXISTS public.notifications (\n';
-            schema += '    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),\n';
-            schema += '    user_id UUID REFERENCES public.users(id),\n';
-            schema += '    title TEXT NOT NULL,\n';
-            schema += '    message TEXT NOT NULL,\n';
-            schema += '    type TEXT NOT NULL,\n';
-            schema += '    read BOOLEAN DEFAULT false,\n';
-            schema += '    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL,\n';
-            schema += '    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE(\'utc\'::text, NOW()) NOT NULL\n';
-            schema += ');\n\n';
-            break;
-        }
+      // Get table definition
+      const tableSchema = await getTableSchema(tableName);
+      if (tableSchema) {
+        schema += `-- Table: ${tableName}\n${tableSchema}\n\n`;
       }
-    }
 
-    // Add trigger for updating updated_at timestamp (applies to all tables)
-    schema += '-- Function to automatically set updated_at timestamp\n';
-    schema += 'CREATE OR REPLACE FUNCTION public.set_updated_at()\n';
-    schema += 'RETURNS TRIGGER AS $$\n';
-    schema += 'BEGIN\n';
-    schema += '    NEW.updated_at = TIMEZONE(\'utc\'::text, NOW());\n';
-    schema += '    RETURN NEW;\n';
-    schema += 'END;\n';
-    schema += '$$ language \'plpgsql\';\n\n';
+      // Get table policies
+      const policies = await getTablePolicies(tableName);
+      if (policies) {
+        schema += `-- RLS Policies for ${tableName}\n${policies}\n\n`;
+      }
 
-    // Add triggers for each table that exists
-    for (const tableName of tablesToCheck) {
-      const exists = await checkTableExists(tableName);
-      if (exists) {
-        schema += `-- Trigger to automatically set updated_at timestamp for ${tableName}\n`;
-        schema += `CREATE TRIGGER set_${tableName}_updated_at\n`;
-        schema += `    BEFORE UPDATE ON public.${tableName}\n`;
-        schema += '    FOR EACH ROW\n';
-        schema += '    EXECUTE FUNCTION public.set_updated_at();\n\n';
+      // Get table triggers
+      const triggers = await getTableTriggers(tableName);
+      if (triggers) {
+        schema += `-- Triggers for ${tableName}\n${triggers}\n\n`;
+      }
+
+      // Get table indexes
+      const indexes = await getTableIndexes(tableName);
+      if (indexes) {
+        schema += `-- Indexes for ${tableName}\n${indexes}\n\n`;
       }
     }
 
